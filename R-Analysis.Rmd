@@ -1,0 +1,467 @@
+---
+title: "Bayesian Analysis of NBA Games"
+author: "Ryan DeStefano"
+date: ''
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+  pdf_document: default
+---
+
+```{r, warning = FALSE, message = FALSE}
+
+library(tidyverse)
+library(janitor)
+library(viridis)
+library(kableExtra)
+library(broom)
+library(aod)
+library(brms)
+library(bayesplot)
+library(tidybayes)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  eval = TRUE
+)
+
+bayes_col = c("#56B4E9", "#E69F00", "#009E73", "#CC79A7", "#CC79A7")
+names(bayes_col) = c("prior", "likelihood", "posterior", "prior_predict", "posterior_predict")
+```
+
+# Research Question
+
+As a fan of the 3 major sports in the United States (Basketball, Football, and Baseball) paired with being a statistics major, I have always been interested in the relationship between winning games and particular stats. When watching these sports you often aren't able to extrapolate as to why certain teams are winning games and often it just appears as "one team is playing better than the other". So, with this project I want to dive into a particular sport and analyze a particular stat and its association with winning games. 
+
+The particular sport I'm going to analyze is basketball, and the variables I'm interested in are the outcome of the the game for the home team (win or loss) and field goal percentage of the home team for that particular game.
+
+**Research Question:** How does field goal percentage of the home team affect winning that particular game for the home team in the NBA? What is the association between field goal percentage and winning?
+
+After this analysis we will be able to predict the probability a home team won their game given the field goal percentage for that particular game, giving us a better understanding of how field goal percentage affects winning.
+
+# The Data
+
+The dataset I'm using is taken from kaggle (https://www.kaggle.com/datasets/wyattowalsh/basketball) and was scraped from NBA.com. The dataset contains all regular season games since 1946 and various stats for both the home and away teams for each game. For the analysis I am only using games from 2012 and later because the NBA experienced a rapid shift in the amount of 3-pointers taken per game around this time, which in turn affects the field goal percentages for teams. Using data from before this shift paired with the more recent NBA seasons would lead to incorrect conclusions being made for prediction of future NBA games, as FG% will be lower in more recent seasons due to the increase in 3-point attempts which are typically made at a lower rate. The data we are training the model on needs be representative of current NBA games, and by only using games from 2012 on achieves this.
+
+I also centered the variable field goal percentage to make the intercept easier to interpret. The intercept now represents the response variable when all explanatory variables are average.
+
+```{r}
+data = read.csv("game.csv")
+
+data = data[data$season_id >= 22012 & data$wl_home != '', c(1, 4, 8, 10:18, 22:25, 27)]
+
+data$fg_pct_home = data$fg_pct_home * 100
+
+#Centering Variables
+data$c_fg_pct_home = data$fg_pct_home - mean(data$fg_pct_home)
+```
+
+# Proposed Model
+
+Since we are analyzing a single variable's affect on winning for NBA teams (which is a binary variable), logistic regression is a good fit. This model will allow us to classify whether we think an NBA team will win or lose based on their field goal percentage in that specific game. The model will give us log odds which we can then convert to a win probability estimate given the home teams FG%
+
+The model will take the following form:
+
+log(odds) = $\beta_0$ + $\beta_1$$x_1$
+
+$\beta_0$: The log odds of the home team winning when the home team has an average field goal percentage.
+
+$\beta_1$: For every increase in 1 percentage point above the average field goal percentage for home teams, the log odds of winning are estimated to increase by $\beta_1$.
+
+$x_1$: FG% value above or below the average FG% for home teams.
+
+# Prior Predictive Tuning
+
+```{r}
+data %>%
+ggplot(aes(x=wl_home)) +
+geom_bar(fill=c("dark blue", "red")) +  labs(x='Game Status', y = "Count")
+
+prop.table(table(data$wl_home))
+```
+
+Above from the bar plot and proportion table we see that in our sample data, the home team wins more often than they lose. Specifically, home teams win 57.6% of time based on our sample. This means that when choosing our priors for the parameters we will want the prior predictive interval to be centered around .576. This would imply that the home team has the highest chance to have a win probability of 57.6% to win any given game. From prior knowledge of basketball, we know that the probability of the home team winning shouldn't be too high and shouldn't be too low, somewhere within the range of 30% to 80%. It isn't plausible that the home team would have a probability of winning outside of that range thus when choosing our priors we must keep this in mind.
+
+When thinking of the prior for $\beta_0$ (which represents the log odds of the home team winning when all explanatory variables are average), we want this value to be equal to the proportion of won home games in the sample (.576). For this to happen we need the log odds to equal .306. This number comes form the interpretation of log odds. Log odds is equivalent to log(pi / (1 - pi)) with pi being the probability of a home team winning the game. Plugging .576 into pi we get .306 for the target value of log odds. A normal prior is sufficient for $\beta_0$ because we have no inclination to whether the log odds are more likely to be higher or lower than the target log odds. This is a safe choice.
+
+We can think of $\beta_2$ in terms of the multiplicative change in odds when our explanatory variable changes. Our explanatory variable is centered field goal percentage, so from prior knowledge we know that a higher field goal percentage is a good thing (making a higher proportion of shots). So, increases in this explanatory variable should lead to increases in the odds of winning. And the multiplicative change in odds is represented by e^$\beta_2$. Keeping this in mind we have a good starting point for what the prior for $\beta_2$ should be centered around. This multiplicative change in odds of winning is 1.1 when $\beta_2$ is .1, this reads as the odds of winning increases by 1% for every increase in 1 field goal percentage point. $\beta_2$ is also going to follow a Normal distribution.
+
+From this good starting point, we can use simulation to estimate a a prior predictive distribution and guess and check until we are satisfied with the results of this distribution based on  our prior knowledge. (Lots of different priors were tested but only the final is shown below)
+
+```{r}
+n_rep = 11760
+
+# simulate parameters from prior distribution
+beta0 = rnorm(n_rep, .306, .1)
+beta1 = rnorm(n_rep, .6, .1)
+
+# simulate log odds values using our regression equation 
+y = beta0 + beta1 * data$c_fg_pct_home
+
+# convert log odds to probability
+probability = exp(y) / (1+exp(y))
+
+# plot the distribution of probabilities
+plot(data$c_fg_pct_home, probability,
+     xlab = "Field Goal Percentage Points Above and Below Average", ylab = "Win Probability", main = "Prior Predictive Distribution of Single Game Win Probabilities",
+     col = bayes_col["prior_predict"])
+```
+
+The plot above is displaying the prior predictive distribution of win probability for home games for different specified values of FG% above and below the average FG% for the specified game. Looking at the vertical cross sections we see that winning probability varies by around 10% in both directions when centered FG% is fixed. This seems reasonable given there are many other factors in the game that could impact the outcome, so while FG% should sway the win probabilities, it should not be by an extreme amount.  
+
+```{r}
+# simulates number of wins in an 82 game season
+n_rep = 82
+
+wins = data.frame(matrix(nrow = 1000, ncol = 1))
+
+for(j in 1:1000){
+  beta0 = rnorm(n_rep, .306, .1)
+  beta1 = rnorm(n_rep, .6, .1)
+  
+  fg_pct = sample(data$c_fg_pct_home, n_rep)
+  
+  y = beta0 + beta1 * fg_pct
+
+  probability = exp(y) / (1 +exp(y))
+
+  win_counter = 0
+
+  for(i in 1:n_rep){
+  win = sample(c('W', 'L'), 1, prob = c(probability[i], 1 - probability[i]))
+    if (win == 'W'){
+    win_counter = win_counter + 1
+    }
+  wins[j, 1] = win_counter
+  }
+}
+
+colnames(wins)[1] = "dubs"
+```
+
+```{r}
+# Plot the Distribution
+ggplot(wins,
+       aes(x = dubs)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 col = bayes_col["posterior"], fill = "white", bins = 60) +
+  geom_density(linewidth = 1, col = bayes_col["posterior"]) +
+  labs(x = "# Games Won") + xlim(15, 75) + ggtitle("Prior Predictive Distribution of Games Won in a Season")
+```
+
+The plot above is displaying a histogram of simulated win totals for a team in an 82 game season using set priors for $\beta_0$ and $\beta_1$. The simulation is using the logistic regression equation with simulated parameters from the prior and simulated centered field goal percentages from the dataset. Looking at the prior predictive distribution for win totals in a 82 game season we see that the distribution is approximately Normal and centered around 45 with most win totals staying within 25 and 60. This seems reasonable considering we were shooting for an estimated probability of winning a game with average FG% being 57.6% (45 is equal to .576 times 82). The range also seems to match our prior beliefs because keeping in mind that each simulated season contains individual game FG% sampled from the dataset. the FG%'s follow a Normal distribution in the dataset so our size 82 sample for each season is likely to contain a small amount of extreme FG% values. So, the distribution above is for seasons in which teams shot around the average FG% for most games.
+
+```{r}
+# prior predictive distribution for a team that shoots the same FG% every game
+n_rep = 11760
+
+# simulate parameters from prior distribution
+  beta0 = rnorm(n_rep, .306, .1)
+  beta1 = rnorm(n_rep, .6, .1)
+
+fg_pct = 5  
+  
+y = beta0 + beta1 * fg_pct
+
+k = data.frame(probability = exp(y) / (1+exp(y)))
+
+# Plot the Distribution
+ggplot(k,
+       aes(x = probability)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 col = bayes_col["posterior"], fill = "white", bins = 60) +
+  geom_density(linewidth = 1, col = bayes_col["posterior"]) +
+  labs(x = "# Games Won") + xlim(.5,1) + ggtitle("Prior Predictive Distribution of Win Probability of Teams with FG% 5 Above Average")
+```
+
+Above is a prior predictive distribution of individual game win probabilities for centered FG% values equal to 5 (5 percentage points above average). We see that in these games, the team typically has very high win probabilities (all above 90%). This seems reasonable considering a 5% FG% above average is a substantial increase over the average. It is likely that teams will win most of their games when shooting this efficiently.
+
+```{r}
+# simulating an 82 game season 
+n_rep = 82
+
+wins = data.frame(matrix(nrow = 1000, ncol = 1))
+
+for(j in 1:1000){
+  beta0 = rnorm(n_rep, .306, .1)
+  beta1 = rnorm(n_rep, .6, .1)
+  
+  fg_pct = 5
+  y = beta0 + beta1 * fg_pct
+
+  probability = exp(y) / (1 +exp(y))
+
+  win_counter = 0
+
+  for(i in 1:n_rep){
+  win = sample(c('W', 'L'), 1, prob = c(probability[i], 1- probability[i]))
+    if (win == 'W'){
+    win_counter = win_counter + 1
+    }
+  wins[j, 1] = win_counter
+  }
+}
+
+colnames(wins)[1] = "dubs"
+```
+
+```{r}
+ggplot(wins,
+       aes(x = dubs)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 col = bayes_col["posterior"], fill = "white", bins = 60) +
+  geom_density(linewidth = 1, col = bayes_col["posterior"]) +
+  labs(x = "# Games Won") + xlim(25,85) + ggtitle("Prior Predictive Distribution of Games Won in a Season")
+```
+
+The above plot displays simulated win totals for seasons in which the team shot 5% above the average FG% in every game. With these specifications, we would expect very high win totals considering the team is shooting efficiently in every game. And, it is what we see as in these seasons teams are estimated to win between 70 and 82 games which are all high win totals.
+
+# Final Prior
+
+The model will be using the following priors as used above:
+
+$\beta_0$ ~ N(.306, .1)
+$\beta_1$ ~ N(.6, .1)
+
+# Likelihood and Model Assumptions
+
+This analysis will be using a normal likelihood, logistic regression works the same as normal regression when looking at the log odds of the curve because log odds is linear. The distribution of log odds for a given centered FG% follows a Normal distribution, thus the Normal likelihood is what will be used.
+
+The assumptions of this logistic regression model are as follows:  
+1) Independent observations  
+2) No multicollinearity between predictors  
+3) Large sample size  
+4) Linear relationship between explanatory variables and logit of response  
+  
+1) is not satisfied since there are repeated measure in the sample (NBA teams have multiple games in the data.    
+2) is satisfied, there is only 1 explanatory variable.  
+3) is satisfied, we have a sample size of 11760.   
+4) is satisfied, as we are specifying that they have a linear relationship.
+
+# Running The Model
+
+```{r}
+fit <-
+  brm(data = data, 
+      family = bernoulli(link = "logit"),
+      formula = wl_home ~ c_fg_pct_home,
+      prior = c(prior(normal(.306, .1), class = Intercept),
+                     prior(normal(0.6, 0.1), class = b)),
+      iter = 3500,
+      warmup = 1000,
+      chains = 4,
+      refresh = 0)
+```
+
+# Posterior Inference 
+
+```{r}
+summary(fit)
+```
+
+Looking at the summary of our model above we see that the most probable estimate for $\beta_0$ is .39 and the most probable estimate for $\beta_1$ is .2.
+
+```{r}
+plot(fit)
+```
+
+```{r}
+pairs(fit)
+```
+
+Looking at the posterior plots of the parameters above we see that it is most probable that the intercept is around .39 and most of the probable values lie within .32 and .46.
+
+It appears most probable that the centered FG% slope is around .22 and most of the plausible values lie between .19 and .21.
+
+```{r}
+posterior = fit |>
+  spread_draws(b_Intercept, b_c_fg_pct_home) 
+
+posterior |> head(10)
+```
+
+```{r}
+quantile(posterior$b_Intercept, c(.01, .1, .25, .75, .9, .99))
+quantile(posterior$b_c_fg_pct_home, c(.01, .1, .25, .75, .9, .99))
+```
+
+There is a posterior probability of:  
+  - 50% that the log odds of the home NBA team winning when they shoot average from the field is between .377 and .405.  
+  - 80% that the log odds of the home NBA team winning when they shoot average from the field is between .365 and .417.  
+  - 98% that the log odds of the home NBA team winning when they shoot average from the field is between .344 and .439.  
+  
+There is a posterior probability of:  
+  - 50% that the log odds of the home NBA team winning increases by between .198 and .205 for every 1 increase in FG%.  
+  - 80% that the log odds of the home NBA team winning increases by between .196 and .207 for every 1 increase in FG%.  
+  - 98% that the log odds of the home NBA team winning increases by between .191 and .213 for every 1 increase in FG%.
+  
+```{r}
+beta0_lb = .344
+exp(beta0_lb) / (1 + exp(beta0_lb))
+
+beta0_ub = .439
+exp(beta0_ub) / (1 + exp(beta0_ub))
+
+beta1_lb = .191
+exp(beta1_lb)
+
+beta1_ub = .213
+exp(beta1_ub) 
+```
+
+The above gives more intuitive values for the credible intervals of the posterior parameters. They are as follows:  
+- There is 98% posterior probability that the probability the home NBA team wins when they have an average FG% for the game lies between 58.5% and 60.8%.  
+- There is 98% posterior probability that the odds of the home NBA team winning the game increases by between 21% and 24% for every 1 increase in FG% for the game. 
+
+```{r}
+ggplot(data, aes(x = c_fg_pct_home, y = wl_home)) + 
+  geom_jitter(size = 0.2) + labs(x = "Centered FG%", y = "Outcome") + ggtitle("Predicted Outcome Using Sample Data FG%")
+```
+
+The plot above shows games and whether they were classified as wins or losses paired with the value of FG% above or below the average FG% for that game. Similarly to what we concluded above, there begins to be a lack of overlap above and below 10% and -10%, this is showing that games with FG%'s as stated are almost always predicted the same way.
+
+# Posterior Prediction
+
+```{r}
+data %>% 
+  add_fitted_draws(fit, n = 100) %>% 
+  ggplot(aes(x = c_fg_pct_home, y = wl_home)) +
+    geom_line(aes(y = .value, group = .draw), size = 0.1) + ggtitle("Simulated Regression Curves Using Posterior Parameters") + labs(x = "Centered FG%", y = "Win Probability")
+```
+
+The plot above depicts 100 different logistic regression curves using parameters simulated from the posterior distribution for the parameters. We see that there is a lot of overlap between the regression curves, this is because the data we used has a large amount of observations so the posterior is weighed heavily towards the likelihood function. Examining the plot we see that the probability of the home team winning begins to increase fairly rapidly around a FG% of 10% below the mean and begins to level out at FG% of 10% above the mean. 
+
+```{r} 
+n_rep = 82
+
+wins = data.frame(matrix(nrow = 1000, ncol = 1))
+
+for(j in 1:1000){
+  beta0 = sample(posterior$b_Intercept, 82)
+  beta1 = sample(posterior$b_c_fg_pct_home, 82)
+
+  fg_pct = sample(data$c_fg_pct_home, 82)
+  y = beta0 + beta1 * fg_pct
+
+  probability = exp(y) / (1 +exp(y))
+
+  win_counter = 0
+
+  for(i in 1:n_rep){
+  win = sample(c('W', 'L'), 1, probability[i])
+    if (win == 'W'){
+    win_counter = win_counter + 1
+    }
+  wins[j, 1] = win_counter
+  }
+}
+
+colnames(wins)[1] = "wins"
+```
+
+```{r}
+ggplot(wins,
+       aes(x = wins)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 col = bayes_col["posterior"], fill = "white", bins = 82) +
+  geom_density(linewidth = 1, col = bayes_col["posterior"]) +
+  labs(x = "# Games Won") +
+  theme_bw() + xlim(1, 82) + ggtitle("Posterior Predictive Distribution of Games Won in a Season")
+```
+
+Again, simulating lots of 82 game seasons with sample FG% values from the sample data we see that teams are predicted to win between around 20 and 60 games. Again this is for seasons in which teams shot around the average FG% each game since the FG% values are sampled from the data which follow a Normal distribution.
+
+# Posterior Predictive Checking
+
+```{r}
+pp_check(fit, ndraw = 100)
+```
+
+This posterior prediction check is very good, there is almost no stray from the sample data in our fitted draws. Our fitted y values follow the sample data very well as seen in the graph. You can barely tell that the sample curves are even overlaid because they follow the data so closely. Again, this is likely because we have a ton of data that we used to build the model so the prior does not have much impact. The data is doing a lot of the talking.
+
+```{r}
+pp_check(fit, type = "hist")
+```
+
+From the histograms we see that our model predicts about a very similar amount of wins (when the x value is equal to 1) as the sample data has wins.
+
+# BRMS Choosing prior
+
+```{r}
+fit2 <-
+  brm(data = data, 
+      family = bernoulli(link = "logit"),
+      formula = wl_home ~ c_fg_pct_home,
+      iter = 3500,
+      warmup = 1000,
+      chains = 4,
+      refresh = 0,
+      sample_prior = "yes")
+```
+
+```{r}
+prior_summary(fit2)
+```
+
+BRMS chooses a flat prior for $\beta_1$ and a student t prior for $\beta_0$. This is a much different prior from what I chose.
+
+```{r}
+plot(fit2)
+```
+
+```{r}
+summary(fit2)
+```
+
+Looking at the posterior parameter graphs along with the output summary we see that the results of this analysis is the exact same as the results of the first analysis with priors specified by me. This is not very surprising because as I have stated before the data we used to fit our model has a very large sample size. Posterior is equal to prior times likelihood and in our case the likelihood values are very specific because of the large sample size, that is, the likelihood values are more informed and precise because of the large sample size. In other words, the likelihood is weighed more heavily because of the large sample size. 
+
+# Frequentist Approach
+
+```{r}
+for (i in 1:nrow(data)){
+  if (data$wl_home[i] == "W"){
+    data$wl_home[i] = 1
+  }
+  else{
+    data$wl_home[i] = 0
+  }
+}
+
+data$wl_home = as.integer(data$wl_home)
+```
+
+```{r}
+mylogit <- glm(wl_home ~ c_fg_pct_home, data = data, family = "binomial")
+
+summary(mylogit)
+
+confint(mylogit)
+
+wald.test(b = coef(mylogit), Sigma = vcov(mylogit), Terms = 1:2)
+
+```
+
+The intercept coefficient tells us that it is estimated that log odds of the home team winning when FG% is average is .39.
+
+The c_fg_pct_home coefficient tells us that that it is estimated that the log odds of winning increases by .2 for every 1 increase in FG%.
+
+For the confidence intervals we have:  
+- We are 95% confident that the true log odds of the home team winning when the team has an average FG% lies between .35 and .44.  
+- We are 95% confident that the log odds of the home team winning increases by between .19 and .21 for every 1 increase in FG%.  
+  
+And, from the Wald test we have that the parameters are significantly useful predictors of log odds of the home team winning since we have a very small p-value.  
+  
+These results are essentially identical to our Bayesian approach. The Frequentist estimates for the coefficients are equal to the most probable parameter estimates in the Bayesian analysis. The posterior credible intervals in the Bayesian analysis are the same intervals as the confidence intervals for the parameters in the Frequentist approach. We also have evidence of a significant affect of the parameters in predicting log odds in both approaches (wald test significant and credible intervals not containing 0).
+
+# Conclusions
+
+There are a few big takeaways from this Bayesian analysis. The first big conclusions are the estimates of the parameters and how they affect the log odds (and probability) of the home team winning a particular game. There is 98% posterior probability that the log odds of the home NBA team winning the game when they shoot an average FG% lies between .344 and .439. There is 98% posterior probability that the log odds of the home NBA team winning the game increases by between .191 and .213 for every 1 increase in FG%. We can translate these log odds to probabilities, which are much more intuitive to interpret by exponentiating the log odds values and dividing by one plus the exponentiated log odds, giving us the following interpretation for $\beta_0$. There is 98% posterior probability that the probability the home NBA team wins when they have an average FG% for the game lies between 58.5% and 60.8%. This tells us that the home team has an advantage over the away team when they shoot averagely. The intuitive interpretation for $\beta_1$ is as follows: there is 98% posterior probability that the odds of the home NBA team winning the game increases by between 21% and 24% for every 1 increase in FG% for the game. This means that better shooting nights are associated with higher odds of winning. We are placing the most posterior plausibility on the intercept parameter being around .39 and the FG% slope parameter being .2. The model very definitively determines a win or loss in games where the FG% is greater than 10% below the average or greater than 10% above the average. When predicting season win totals, the model predicts that a home team that shoots around the average FG% in every game will win between 25 and 60 games out of 82 games, with the highest likelihood of games won being around 45. This model is very reliable, the posterior predictive check plot has no issues at all, our sample repetitions using the sample data’s FG% values match the actual data very closely. The assumption of independence in observations is violated and the data does not come from a random sample so we cannot conclude a casual relationship between FG% and probability of the home NBA winning a game, however since the data comes from a reliable source and is big in number, we can conclude that there is an association between the two variables. We also conclude that the choice of prior does not matter in our case because the sample data is so large.
+
+# References
+
+- https://stats.oarc.ucla.edu/r/dae/logit-regression/  
+- https://www.bayesrulesbook.com/chapter-13.html#ch13-post-sim-sec
